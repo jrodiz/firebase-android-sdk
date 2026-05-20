@@ -145,6 +145,13 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
   private final DrawCounter onDrawCounterListener = new DrawCounter();
   private boolean systemForegroundCheck = false;
 
+  // Phase 1 shadow capture for the causal-signal refactor (see PLAN_PHASE1_SHADOW_CAPTURE.md
+  // and the TODO in resolveIsStartedFromBackground). Captured once during
+  // registerActivityLifecycleCallbacks; emitted as custom attributes on the experiment
+  // trace alongside the timing-window decision so we can compare both in production
+  // telemetry before flipping the decision in Phase 2. Does not affect classification.
+  private @Nullable ProcessStartCause processStartCause = null;
+
   /**
    * Called from onCreate() method of an activity by instrumented byte code.
    *
@@ -235,6 +242,10 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
     if (appContext instanceof Application) {
       ((Application) appContext).registerActivityLifecycleCallbacks(this);
       systemForegroundCheck = systemForegroundCheck || isAnyAppProcessInForeground(appContext);
+      // Phase 1: shadow-capture the OS's causal signal as early as possible (this method
+      // runs from FirebasePerfEarly during the ContentProvider init chain). Does not
+      // affect the existing decision; see comment on the field for details.
+      processStartCause = ProcessStartCause.capture(appContext);
       isRegisteredForLifecycleCallbacks = true;
       this.appContext = appContext;
     }
@@ -332,9 +343,56 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
     }
     this.experimentTtid.putCustomAttributes(
         "systemDeterminedForeground", systemForegroundCheck ? "true" : "false");
+    addProcessStartCauseExperimentAttributes(this.experimentTtid);
     this.experimentTtid.putCounters("onDrawCount", onDrawCount);
     this.experimentTtid.addPerfSessions(this.startSession.build());
     logExperimentTrace(this.experimentTtid);
+  }
+
+  /**
+   * Phase 1 of the causal-signal refactor: attach the captured {@link ProcessStartCause}
+   * as custom attributes on the {@code _experiment_app_start_ttid} trace, alongside the
+   * existing timing-window decision, so production telemetry can compare them. Does not
+   * affect classification. See {@code PLAN_PHASE1_SHADOW_CAPTURE.md}.
+   */
+  private void addProcessStartCauseExperimentAttributes(TraceMetric.Builder trace) {
+    ProcessStartCause cause = this.processStartCause;
+    if (cause == null) {
+      // Cause is captured during registerActivityLifecycleCallbacks. If we somehow got
+      // here without that running, fall through and just record what we can.
+      trace.putCustomAttributes("processStartCause", "unknown");
+      trace.putCustomAttributes(
+          "timingWindowDecision", isStartedFromBackground ? "background" : "foreground");
+      trace.putCustomAttributes("decisionAgreed", "false");
+      return;
+    }
+
+    String causeName;
+    switch (cause.cause) {
+      case FOREGROUND:
+        causeName = "foreground";
+        break;
+      case BACKGROUND:
+        causeName = "background";
+        break;
+      default:
+        causeName = "unknown";
+        break;
+    }
+    String timingDecision = isStartedFromBackground ? "background" : "foreground";
+    String agreed =
+        (cause.cause == ProcessStartCause.Cause.UNKNOWN)
+            ? "unknown"
+            : (causeName.equals(timingDecision) ? "true" : "false");
+
+    trace.putCustomAttributes("processStartCause", causeName);
+    trace.putCustomAttributes("processStartReasonApi35Plus", cause.reasonName);
+    trace.putCustomAttributes("processStartTypeApi35Plus", cause.startTypeName);
+    trace.putCustomAttributes(
+        "processImportanceApi34",
+        (cause.apiLevel == 34 && cause.importance >= 0) ? String.valueOf(cause.importance) : "");
+    trace.putCustomAttributes("timingWindowDecision", timingDecision);
+    trace.putCustomAttributes("decisionAgreed", agreed);
   }
 
   /**
@@ -661,5 +719,16 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
   @VisibleForTesting
   void setMainThreadRunnableTime(Timer timer) {
     mainThreadRunnableTime = timer;
+  }
+
+  @VisibleForTesting
+  void setProcessStartCauseForTest(@Nullable ProcessStartCause cause) {
+    this.processStartCause = cause;
+  }
+
+  @VisibleForTesting
+  @Nullable
+  ProcessStartCause getProcessStartCauseForTest() {
+    return processStartCause;
   }
 }

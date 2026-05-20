@@ -16,6 +16,7 @@ package com.google.firebase.perf.metrics;
 
 import static com.google.common.truth.Truth.assertThat;
 import static org.mockito.ArgumentMatchers.isA;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
@@ -397,5 +398,57 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
     assertThat(ttid.getDurationUs()).isNotEqualTo(resumeTime - appStartTime);
     assertThat(ttid.getDurationUs()).isEqualTo(drawTime - appStartTime);
     assertThat(ttid.getSubtracesCount()).isEqualTo(3);
+  }
+
+  /**
+   * Phase 1 of the causal-signal refactor (see PLAN_PHASE1_SHADOW_CAPTURE.md): the
+   * experiment trace must carry the captured cause and the timing-window decision so we
+   * can compare them in production telemetry.
+   */
+  @Test
+  @Config(sdk = 26)
+  public void experimentTrace_includesProcessStartCauseAttributes() {
+    when(clock.getTime()).thenCallRealMethod();
+    View testView = new View(appContext);
+    when(activity1.findViewById(android.R.id.content)).thenReturn(testView);
+    when(configResolver.getIsExperimentTTIDEnabled()).thenReturn(true);
+    FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
+    AppStartTrace trace =
+        new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
+    trace.registerActivityLifecycleCallbacks(appContext);
+
+    // Force a known ProcessStartCause so the test doesn't depend on Robolectric's
+    // default ActivityManager state. Pre-API-34 capture yields UNKNOWN with empty
+    // reason/startType strings, which is exactly what the helper would compute here.
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
+
+    trace.onActivityCreated(activity1, bundle);
+    trace.onActivityStarted(activity1);
+    trace.onActivityResumed(activity1);
+
+    testView.getViewTreeObserver().dispatchOnPreDraw();
+    testView.getViewTreeObserver().dispatchOnDraw();
+    shadowOf(Looper.getMainLooper()).idle();
+    fakeExecutorService.runAll();
+
+    verify(transportManager, atLeastOnce())
+        .log(traceArgumentCaptor.capture(), isA(ApplicationProcessState.class));
+
+    TraceMetric ttid = null;
+    for (TraceMetric metric : traceArgumentCaptor.getAllValues()) {
+      if ("_experiment_app_start_ttid".equals(metric.getName())) {
+        ttid = metric;
+      }
+    }
+    assertThat(ttid).isNotNull();
+    assertThat(ttid.getCustomAttributesMap()).containsEntry("processStartCause", "foreground");
+    assertThat(ttid.getCustomAttributesMap())
+        .containsEntry("processStartReasonApi35Plus", "LAUNCHER");
+    assertThat(ttid.getCustomAttributesMap()).containsEntry("processStartTypeApi35Plus", "COLD");
+    // The injected cause has apiLevel=35, so the API-34-only importance attribute stays empty.
+    assertThat(ttid.getCustomAttributesMap()).containsEntry("processImportanceApi34", "");
+    assertThat(ttid.getCustomAttributesMap()).containsEntry("timingWindowDecision", "foreground");
+    assertThat(ttid.getCustomAttributesMap()).containsEntry("decisionAgreed", "true");
   }
 }

@@ -17,6 +17,7 @@ package com.google.firebase.perf.metrics;
 import android.app.ActivityManager;
 import android.content.Context;
 import android.os.Build;
+import android.os.Process;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
@@ -147,9 +148,15 @@ final class ProcessStartCause {
 
     final int importance = readImportance();
 
-    // API 35+ path: ApplicationStartInfo is authoritative.
+    // API 35+ path: ApplicationStartInfo is the preferred signal, but ONLY when the
+    // returned record actually belongs to the current process. The OS-side history
+    // can be stale (a record from a previous run of the app can be at index 0 if the
+    // current start hasn't been recorded yet — observed on API 35 emulator during
+    // rapid-restart testing). Filtering by PID avoids classifying a background start
+    // as FOREGROUND just because the previous run was a launcher tap.
     if (apiLevel >= 35) {
-      ApplicationStartInfoView startInfo = readApplicationStartInfo(activityManager);
+      ApplicationStartInfoView startInfo =
+          readApplicationStartInfoForCurrentProcess(activityManager);
       if (startInfo != null) {
         return new ProcessStartCause(
             classifyReason(startInfo.reason),
@@ -158,12 +165,14 @@ final class ProcessStartCause {
             importance,
             apiLevel);
       }
-      // Fall through if reflective access returned nothing (unexpected on API 35+, but
-      // defensive). importance is still useful telemetry.
+      // No matching record yet — fall through to the importance-based classification
+      // (same heuristic as API 34). importance reflects the actual current process
+      // state, so it's a safe fallback.
     }
 
-    // API 34: importance at first capture distinguishes foreground from background starts.
-    if (apiLevel == 34) {
+    // API 34 (and API 35+ when ApplicationStartInfo wasn't usable): importance at
+    // first capture distinguishes foreground from background starts.
+    if (apiLevel >= 34) {
       Cause cause =
           importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
               ? Cause.FOREGROUND
@@ -186,13 +195,23 @@ final class ProcessStartCause {
   }
 
   /**
-   * Reflectively call {@code ActivityManager.getHistoricalProcessStartReasons(int)} and
-   * pull {@code getReason()} / {@code getStartType()} off the first returned
-   * {@code ApplicationStartInfo}. Returns {@code null} if anything goes wrong; callers
-   * must handle the null case.
+   * Reflectively call {@code ActivityManager.getHistoricalProcessStartReasons(int)},
+   * search the returned list for an entry whose {@code getPid()} matches
+   * {@link Process#myPid()}, and pull {@code getReason()} / {@code getStartType()}
+   * from it.
+   *
+   * <p>The OS-side history is not guaranteed to have recorded the current process's
+   * start by the time we query — index 0 can be a stale entry from a previous run of
+   * the app. Filtering by PID prevents that stale entry from contaminating the
+   * classification (observed on API 35 emulator during rapid-restart testing: a
+   * background-broadcast start was classified as FOREGROUND/LAUNCHER because the API
+   * returned the previous foreground launch's record).
+   *
+   * <p>Returns {@code null} if reflection fails or no record matches the current PID.
+   * Callers must handle the null case.
    */
   @Nullable
-  private static ApplicationStartInfoView readApplicationStartInfo(
+  private static ApplicationStartInfoView readApplicationStartInfoForCurrentProcess(
       @NonNull ActivityManager activityManager) {
     if (Build.VERSION.SDK_INT < 35) {
       return null;
@@ -200,7 +219,9 @@ final class ProcessStartCause {
     try {
       Method getHistoricalProcessStartReasons =
           ActivityManager.class.getMethod("getHistoricalProcessStartReasons", int.class);
-      Object result = getHistoricalProcessStartReasons.invoke(activityManager, 1);
+      // Query a handful of entries (not just 1) so we can find the one for the current
+      // process. 5 is generous; in practice the current run is at or near index 0.
+      Object result = getHistoricalProcessStartReasons.invoke(activityManager, 5);
       if (!(result instanceof List)) {
         return null;
       }
@@ -208,19 +229,29 @@ final class ProcessStartCause {
       if (list.isEmpty()) {
         return null;
       }
-      Object startInfo = list.get(0);
-      if (startInfo == null) {
-        return null;
+      int myPid = Process.myPid();
+      for (Object startInfo : list) {
+        if (startInfo == null) {
+          continue;
+        }
+        Class<?> startInfoClass = startInfo.getClass();
+        Method getPid = startInfoClass.getMethod("getPid");
+        Object pid = getPid.invoke(startInfo);
+        if (!(pid instanceof Integer) || (Integer) pid != myPid) {
+          continue;
+        }
+        Method getReason = startInfoClass.getMethod("getReason");
+        Method getStartType = startInfoClass.getMethod("getStartType");
+        Object reason = getReason.invoke(startInfo);
+        Object startType = getStartType.invoke(startInfo);
+        if (!(reason instanceof Integer) || !(startType instanceof Integer)) {
+          return null;
+        }
+        return new ApplicationStartInfoView((Integer) reason, (Integer) startType);
       }
-      Class<?> startInfoClass = startInfo.getClass();
-      Method getReason = startInfoClass.getMethod("getReason");
-      Method getStartType = startInfoClass.getMethod("getStartType");
-      Object reason = getReason.invoke(startInfo);
-      Object startType = getStartType.invoke(startInfo);
-      if (!(reason instanceof Integer) || !(startType instanceof Integer)) {
-        return null;
-      }
-      return new ApplicationStartInfoView((Integer) reason, (Integer) startType);
+      // No record matches the current PID — the OS hasn't yet recorded this process's
+      // start, or recorded it without a PID. Caller falls back to importance.
+      return null;
     } catch (Throwable t) {
       return null;
     }

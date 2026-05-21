@@ -3,6 +3,11 @@
 - [fixed] Fixed `_app_start` traces being suppressed on API 34+ devices for typical
   real-world apps by widening the foreground/background-start timing window to account
   for Android's main-thread vs Binder scheduling on physical devices. [#8103]
+- [changed] Added an opt-in pathway that lets `AppStartTrace` consult the OS-provided
+  process start cause (`ApplicationStartInfo.getReason()` on API 35+,
+  `RunningAppProcessInfo.importance` on API 34) before falling back to the timing-window
+  heuristic. Gated by a Remote Config flag and defaulted to off; no behavior change for
+  any app until the flag is flipped. [#8103]
 
 # 22.0.5
 

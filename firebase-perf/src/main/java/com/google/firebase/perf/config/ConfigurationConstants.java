@@ -726,4 +726,48 @@ final class ConfigurationConstants {
       return "experiment_app_start_ttid";
     }
   }
+
+  /**
+   * Kill switch for Phase 2 of the AppStartTrace causal-signal refactor (see
+   * PLAN_APPSTART_CAUSAL_SIGNAL.md and PLAN_PHASE2.md). When enabled,
+   * {@code AppStartTrace.resolveIsStartedFromBackground()} consults
+   * {@code ProcessStartCause} first and only falls back to the existing timing-window
+   * heuristic when the causal signal is {@code UNKNOWN}. Default off so Phase 2 ships
+   * dark; flip via Remote Config or developer manifest entry once Phase 1 telemetry
+   * confirms the signal is reliable in production.
+   */
+  protected static final class ExperimentAppStartCausalSignal extends ConfigurationFlag<Boolean> {
+    private static ExperimentAppStartCausalSignal instance;
+
+    private ExperimentAppStartCausalSignal() {
+      super();
+    }
+
+    protected static synchronized ExperimentAppStartCausalSignal getInstance() {
+      if (instance == null) {
+        instance = new ExperimentAppStartCausalSignal();
+      }
+      return instance;
+    }
+
+    @Override
+    protected Boolean getDefault() {
+      return false;
+    }
+
+    @Override
+    protected String getRemoteConfigFlag() {
+      return "fpr_experiment_app_start_causal_signal";
+    }
+
+    @Override
+    protected String getDeviceCacheFlag() {
+      return "com.google.firebase.perf.ExperimentAppStartCausalSignal";
+    }
+
+    @Override
+    protected String getMetadataFlag() {
+      return "experiment_app_start_causal_signal";
+    }
+  }
 }

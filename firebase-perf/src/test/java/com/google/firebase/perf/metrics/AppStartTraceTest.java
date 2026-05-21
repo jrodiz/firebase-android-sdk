@@ -351,6 +351,155 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
             ArgumentMatchers.nullable(ApplicationProcessState.class));
   }
 
+  // --- Phase 2 tests: causal-signal-driven decision, gated by kill switch ---
+
+  /**
+   * Helper that builds an AppStartTrace, registers callbacks, and primes a
+   * {@code mainThreadRunnableTime} with the given duration. Used by Phase 2 tests so
+   * each one shows only the bits that vary (flag state, cause, duration).
+   */
+  private AppStartTrace newTraceWithRunnable(
+      FakeScheduledExecutorService executor, long mainThreadRunnableDurationMicros) {
+    Timer fakeTimer = spy(new Timer(currentTime));
+    when(fakeTimer.getDurationMicros()).thenReturn(mainThreadRunnableDurationMicros);
+    AppStartTrace trace = new AppStartTrace(transportManager, clock, configResolver, executor);
+    trace.registerActivityLifecycleCallbacks(appContext);
+    trace.setMainThreadRunnableTime(fakeTimer);
+    return trace;
+  }
+
+  @Test
+  public void causalSignal_off_usesExistingTimingWindow() {
+    // Flag off + cause FOREGROUND + timing over the threshold ⇒ existing behavior wins,
+    // trace suppressed. Causal signal is ignored when the kill switch is off.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
+    // configResolver.getIsAppStartCausalSignalEnabled() defaults to false on the mock.
+
+    trace.onActivityCreated(activity1, bundle);
+
+    Assert.assertNull(trace.getOnCreateTime());
+    executor.runAll();
+    verify(transportManager, times(0))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  @Test
+  public void causalSignal_on_foregroundCause_overridesTimingWindow() {
+    // Flag on + cause FOREGROUND + timing over the threshold ⇒ causal signal wins,
+    // trace IS logged despite the timing window pointing to background.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
+
+    trace.onActivityCreated(activity1, bundle);
+    Assert.assertNotNull(trace.getOnCreateTime());
+    ++currentTime;
+    trace.onActivityStarted(activity1);
+    Assert.assertNotNull(trace.getOnStartTime());
+    ++currentTime;
+    trace.onActivityResumed(activity1);
+    Assert.assertNotNull(trace.getOnResumeTime());
+    executor.runAll();
+
+    verify(transportManager, times(1))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  @Test
+  public void causalSignal_on_backgroundCause_suppressesEvenWithFastTiming() {
+    // Flag on + cause BACKGROUND + timing inside the threshold ⇒ causal signal wins,
+    // trace IS suppressed even though the timing window would have logged it.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(50));
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.BACKGROUND, "BROADCAST", "COLD", 400, 35));
+
+    trace.onActivityCreated(activity1, bundle);
+    Assert.assertNull(trace.getOnCreateTime());
+    executor.runAll();
+
+    verify(transportManager, times(0))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  @Test
+  public void causalSignal_on_unknownCause_fallsBackToTimingWindow_suppress() {
+    // Flag on + cause UNKNOWN + timing over the threshold ⇒ timing window applies,
+    // trace suppressed.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 100, 34));
+
+    trace.onActivityCreated(activity1, bundle);
+
+    Assert.assertNull(trace.getOnCreateTime());
+    executor.runAll();
+    verify(transportManager, times(0))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  @Test
+  public void causalSignal_on_unknownCause_fallsBackToTimingWindow_log() {
+    // Flag on + cause UNKNOWN + timing inside the threshold ⇒ timing window applies,
+    // trace IS logged.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(50));
+    trace.setProcessStartCauseForTest(
+        new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 100, 34));
+
+    trace.onActivityCreated(activity1, bundle);
+    Assert.assertNotNull(trace.getOnCreateTime());
+    ++currentTime;
+    trace.onActivityStarted(activity1);
+    Assert.assertNotNull(trace.getOnStartTime());
+    ++currentTime;
+    trace.onActivityResumed(activity1);
+    Assert.assertNotNull(trace.getOnResumeTime());
+    executor.runAll();
+
+    verify(transportManager, times(1))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  @Test
+  public void causalSignal_on_nullProcessStartCause_fallsBackToTimingWindow() {
+    // Defensive: if the field is somehow null at decision time (e.g. registration
+    // failure path), the kill-switch-on branch must not NPE; the existing timing window
+    // takes over.
+    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
+    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
+    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    trace.setProcessStartCauseForTest(null);
+
+    trace.onActivityCreated(activity1, bundle);
+
+    Assert.assertNull(trace.getOnCreateTime());
+    executor.runAll();
+    verify(transportManager, times(0))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
   @Test
   @Config(sdk = 26)
   public void timeToInitialDisplay_isLogged() {

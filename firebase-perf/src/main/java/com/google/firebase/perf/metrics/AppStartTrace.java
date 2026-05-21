@@ -407,23 +407,41 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
    * foreground start.
    * See b/339891952 and https://github.com/firebase/firebase-android-sdk/issues/8103.
    *
-   * <p>TODO(b/339891952): Replace this timing-window heuristic with a causal signal.
-   * The current approach infers "was the process forked to launch an Activity?" from the
-   * ordering of a posted runnable vs the first onActivityCreated callback, which is
-   * inherently fragile (its calibration depends on Android scheduling behavior that has
-   * already shifted once on API 34+ and could shift again). Better candidates:
+   * <p>TODO(b/339891952): Replace this timing-window heuristic with the causal signal
+   * captured in {@link #processStartCause} (see {@link ProcessStartCause}).
+   *
+   * <p>The current approach infers "was the process forked to launch an Activity?" from
+   * the ordering of a posted runnable vs the first {@code onActivityCreated} callback,
+   * which is inherently fragile (its calibration depends on Android scheduling behavior
+   * that has already shifted once on API 34+ and could shift again).
+   *
+   * <p>Phase 1 (already implemented in this file): capture {@link ProcessStartCause}
+   * early in {@link #registerActivityLifecycleCallbacks(Context)} and emit it alongside
+   * the timing-window decision as custom attributes on the
+   * {@code _experiment_app_start_ttid} trace. No behavior change. See
+   * {@code PLAN_PHASE1_SHADOW_CAPTURE.md}.
+   *
+   * <p>Phase 2 (pending — this TODO): once production telemetry from Phase 1 confirms
+   * the signal matches expectations, consult {@code processStartCause.cause} first in
+   * this method:
    * <ul>
-   *   <li>API 35+: use {@code ActivityManager.getHistoricalProcessStartReasons} /
-   *       {@code ApplicationStartInfo}, which authoritatively reports the start reason
-   *       ({@code START_REASON_LAUNCHER}, {@code START_REASON_SERVICE},
-   *       {@code START_REASON_CONTENT_PROVIDER}, etc.). This removes the heuristic
-   *       entirely on supported devices.
-   *   <li>API 34: capture {@code ActivityManager.RunningAppProcessInfo.importanceReasonCode}
-   *       and {@code .importance} once early in {@code FirebasePerfEarly} (before any of
-   *       our own ContentProvider work mutates the cause), and combine with the timing
-   *       window as a fallback for ambiguous cases.
+   *   <li>{@code FOREGROUND} ⇒ skip the timing-window check entirely; trace logs.
+   *   <li>{@code BACKGROUND} ⇒ set {@code isStartedFromBackground = true} directly;
+   *       trace is suppressed.
+   *   <li>{@code UNKNOWN} ⇒ fall back to the existing timing window.
    * </ul>
-   * Adopting either of these would also let the API-34-vs-pre-34 branch below collapse.
+   * Gate behind a remote-config kill switch so we can roll back quickly if production
+   * data looks wrong.
+   *
+   * <p>Phase 3 (pending): once Phase 2 is stable, delete
+   * {@link #MAX_BACKGROUND_RUNNABLE_DELAY}, {@link StartFromBackgroundRunnable},
+   * {@code mainThreadRunnableTime}, and the {@code Build.VERSION.SDK_INT < 34} branch
+   * below (the helper already returns {@code UNKNOWN} on pre-API-34, so the timing
+   * window naturally remains the sole signal there with zero code changes).
+   *
+   * <p>See {@code PLAN_APPSTART_CAUSAL_SIGNAL.md} for the full multi-phase plan and
+   * {@code RESULTS.md} in the {@code api34-appstart-cause} experiment project for the
+   * empirical basis.
    */
   private void resolveIsStartedFromBackground() {
     // If the mainThreadRunnableTime is null, either the runnable hasn't run, or this check has

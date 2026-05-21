@@ -8,6 +8,12 @@
   `RunningAppProcessInfo.importance` on API 34) before falling back to the timing-window
   heuristic. Gated by a Remote Config flag and defaulted to off; no behavior change for
   any app until the flag is flipped. [#8103]
+- [changed] Removed the legacy timing-window machinery from `AppStartTrace` on API 34+.
+  Pre-API-34 behavior is unchanged. On API 34+ with the
+  `fpr_experiment_app_start_causal_signal` Remote Config flag **on**, the OS-provided
+  process start cause owns the decision (no timing fallback). With the flag **off**
+  (the current default), API 34+ skips background-start detection entirely until a
+  follow-up release flips the default. [#8103]
 
 # 22.0.5
 

@@ -74,22 +74,6 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
   private static final @NonNull Timer PERF_CLASS_LOAD_TIME = new Clock().getTime();
   private static final long MAX_LATENCY_BEFORE_UI_INIT = TimeUnit.MINUTES.toMicros(1);
 
-  // If the `mainThreadRunnableTime` was set within this duration, the assumption
-  // is that it was called immediately before `onActivityCreated` in foreground starts on API 34+.
-  //
-  // On API 34+, Android may drain posted main-thread runnables before processing the
-  // Activity-launch Binder transaction even during a genuine cold foreground start. The
-  // resulting gap between `StartFromBackgroundRunnable` firing and the first
-  // `onActivityCreated` is dominated by system scheduling, not by app work, and has been
-  // measured at ~316ms on a minimal repro app and ~204ms on a large production app on
-  // physical Pixel devices. The threshold must therefore comfortably exceed these
-  // real-world gaps; 1000ms provides ~5x headroom over the worst measured cold-start gap
-  // while still being two orders of magnitude below `MAX_LATENCY_BEFORE_UI_INIT` so that
-  // genuine warm starts (where the process was forked for background work seconds-to-
-  // minutes before any activity launch) remain correctly suppressed.
-  // See b/339891952 and https://github.com/firebase/firebase-android-sdk/issues/8103.
-  private static final long MAX_BACKGROUND_RUNNABLE_DELAY = TimeUnit.MILLISECONDS.toMicros(1000);
-
   // Core pool size 0 allows threads to shut down if they're idle
   private static final int CORE_POOL_SIZE = 0;
   private static final int MAX_POOL_SIZE = 1; // Only need single thread
@@ -396,84 +380,68 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
   }
 
   /**
-   * Sets the `isStartedFromBackground` flag to `true` if the `mainThreadRunnableTime` was set
-   * from the `StartFromBackgroundRunnable`.
-   * <p>
-   * If it's prior to API 34, it's always set to true if `mainThreadRunnableTime` was set.
-   * <p>
-   * If it's on or after API 34, and it was called less than `MAX_BACKGROUND_RUNNABLE_DELAY`
-   * before `onActivityCreated`, the
-   * assumption is that it was called immediately before the activity lifecycle callbacks in a
-   * foreground start.
-   * See b/339891952 and https://github.com/firebase/firebase-android-sdk/issues/8103.
+   * Decides whether this process start was a background-only event and, if so, sets
+   * {@link #isStartedFromBackground} so the subsequent {@code onActivityCreated} /
+   * {@code onActivityStarted} / {@code onActivityResumed} callbacks suppress the
+   * {@code _app_start} trace.
    *
-   * <p>Phase 1 (done): captures {@link ProcessStartCause} early in
-   * {@link #registerActivityLifecycleCallbacks(Context)} and emits it as custom
-   * attributes on the {@code _experiment_app_start_ttid} trace alongside the
-   * timing-window decision. See {@code PLAN_PHASE1_SHADOW_CAPTURE.md}.
+   * <p>Split by OS major version:
+   * <ul>
+   *   <li><b>API &lt; 34</b>: pre-bug main-thread ordering still holds. If
+   *       {@link StartFromBackgroundRunnable} fired before the first
+   *       {@code onActivityCreated} ({@code mainThreadRunnableTime != null}), the
+   *       process was forked for a non-activity reason and we suppress.
+   *   <li><b>API 34+ with kill switch off</b> (default in Phase 3): no detection here;
+   *       the trace logs unconditionally on {@code onActivityCreated}. Phase 4 will
+   *       flip the kill switch default to {@code true} and close this gap.
+   *   <li><b>API 34+ with kill switch on</b>: {@link ProcessStartCause} owns the
+   *       decision. {@code FOREGROUND} lets the trace log; {@code BACKGROUND} and
+   *       {@code UNKNOWN} both suppress (no timing-window fallback — that machinery
+   *       was deleted in Phase 3).
+   * </ul>
    *
-   * <p>Phase 2 (done — this method's body below): when
-   * {@link ConfigResolver#getIsAppStartCausalSignalEnabled()} is true and the captured
-   * cause is {@link ProcessStartCause.Cause#FOREGROUND} or
-   * {@link ProcessStartCause.Cause#BACKGROUND}, the causal signal owns the decision and
-   * the timing-window check is skipped. {@link ProcessStartCause.Cause#UNKNOWN} (and
-   * the kill-switch-off path) still uses the existing heuristic. Kill switch defaults
-   * to off; flip via Remote Config once production telemetry confirms agreement. See
-   * {@code PLAN_PHASE2.md}.
+   * <p>TODO(b/339891952): Phase 4 — flip
+   * {@link ConfigurationConstants.ExperimentAppStartCausalSignal} default to
+   * {@code true} to close the API 34+ "no detection" gap left by Phase 3.
    *
-   * <p>TODO(b/339891952): Phase 3 — once Phase 2 is stable at 100% rollout in
-   * production, delete {@link #MAX_BACKGROUND_RUNNABLE_DELAY},
-   * {@link StartFromBackgroundRunnable}, {@code mainThreadRunnableTime}, and the
-   * {@code Build.VERSION.SDK_INT < 34} branch below (the helper already returns
-   * {@code UNKNOWN} on pre-API-34, so the timing window naturally remains the sole
-   * signal there with zero code changes).
-   *
-   * <p>See {@code PLAN_APPSTART_CAUSAL_SIGNAL.md} for the full multi-phase plan and
+   * <p>See {@code PLAN_APPSTART_CAUSAL_SIGNAL.md} for the multi-phase plan and
    * {@code RESULTS.md} in the {@code api34-appstart-cause} experiment project for the
-   * empirical basis.
+   * empirical basis. See b/339891952 and
+   * https://github.com/firebase/firebase-android-sdk/issues/8103.
    */
   private void resolveIsStartedFromBackground() {
-    // If the mainThreadRunnableTime is null, either the runnable hasn't run, or this check has
-    // already been made.
-    if (mainThreadRunnableTime == null) {
+    if (Build.VERSION.SDK_INT < 34) {
+      // Pre-API-34: the runnable-fired-before-onActivityCreated ordering is reliable.
+      if (mainThreadRunnableTime != null) {
+        isStartedFromBackground = true;
+        mainThreadRunnableTime = null;
+      }
       return;
     }
 
-    // Phase 2: when the causal-signal kill switch is on AND ProcessStartCause has a
-    // confident answer, let it own the decision. The timing window only runs for
-    // UNKNOWN cases (API < 34 helper output, or API 35+ where the historical-reasons
-    // API returned nothing). See PLAN_PHASE2.md.
-    if (configResolver.getIsAppStartCausalSignalEnabled() && processStartCause != null) {
-      switch (processStartCause.cause) {
-        case FOREGROUND:
-          // Definitely foreground per OS-provided cause. Don't mark background; let the
-          // trace flow through.
-          mainThreadRunnableTime = null;
-          return;
-        case BACKGROUND:
-          // OS-provided cause says this process was forked for a non-activity reason.
-          // Suppress regardless of timing-window outcome.
-          isStartedFromBackground = true;
-          mainThreadRunnableTime = null;
-          return;
-        case UNKNOWN:
-          // Fall through to the existing heuristic.
-          break;
-      }
+    // API 34+ kill switch off (default in Phase 3): the legacy timing-window machinery
+    // is gone. No background-start detection on this path. Trace logs unconditionally.
+    if (!configResolver.getIsAppStartCausalSignalEnabled()) {
+      return;
     }
 
-    // If the `mainThreadRunnableTime` was set prior to API 34, it's always assumed that's it's
-    // a background start.
-    // Otherwise it's assumed to be a background start if the runnable was set more than
-    // `MAX_BACKGROUND_RUNNABLE_DELAY`
-    // before the first `onActivityCreated` call.
-    if ((Build.VERSION.SDK_INT < 34)
-        || (mainThreadRunnableTime.getDurationMicros() > MAX_BACKGROUND_RUNNABLE_DELAY)) {
+    // API 34+ kill switch on: ProcessStartCause is the only signal.
+    if (processStartCause == null) {
+      // Defensive: cause wasn't captured (registration didn't run). Suppress to be
+      // safe; we'd rather miss a trace than emit one with no provenance.
       isStartedFromBackground = true;
+      return;
     }
-
-    // Set this to null to prevent additional checks.
-    mainThreadRunnableTime = null;
+    switch (processStartCause.cause) {
+      case FOREGROUND:
+        // Trace logs.
+        return;
+      case BACKGROUND:
+      case UNKNOWN:
+        // Suppress. No fallback in Phase 3.
+        isStartedFromBackground = true;
+        return;
+    }
   }
 
   @Override

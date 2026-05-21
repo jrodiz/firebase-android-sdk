@@ -15,6 +15,7 @@
 package com.google.firebase.perf;
 
 import android.content.Context;
+import android.os.Build;
 import androidx.annotation.Nullable;
 import com.google.firebase.FirebaseApp;
 import com.google.firebase.StartupTime;
@@ -48,7 +49,14 @@ public class FirebasePerfEarly {
     if (startupTime != null) {
       AppStartTrace appStartTrace = AppStartTrace.getInstance();
       appStartTrace.registerActivityLifecycleCallbacks(context);
-      uiExecutor.execute(new AppStartTrace.StartFromBackgroundRunnable(appStartTrace));
+      if (Build.VERSION.SDK_INT < 34) {
+        // Pre-API-34: the posted runnable records mainThreadRunnableTime, which the
+        // pre-bug ordering check in AppStartTrace.resolveIsStartedFromBackground()
+        // consumes. On API 34+ the runnable is unused after Phase 3 (causal signal
+        // owns the decision when the kill switch is on; no detection when off), so we
+        // skip the main-thread post to save a queued message during cold launch.
+        uiExecutor.execute(new AppStartTrace.StartFromBackgroundRunnable(appStartTrace));
+      }
     }
 
     // TODO: Bring back Firebase Sessions dependency to watch for updates to sessions.

@@ -239,103 +239,23 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
             ArgumentMatchers.nullable(ApplicationProcessState.class));
   }
 
+  // --- Pre-API-34 regression tests for the legacy pre-bug-ordering path ---
+  //
+  // Phase 3 deleted the API 34+ timing-window machinery (MAX_BACKGROUND_RUNNABLE_DELAY
+  // and the threshold check in resolveIsStartedFromBackground). The pre-API-34 path
+  // still uses mainThreadRunnableTime to detect "runnable fired before any activity",
+  // so these tests lock in that behavior on the still-active code path.
+
   @Test
-  public void testStartFromBackground_within1000ms() {
+  @Config(sdk = 33)
+  public void preApi34_runnableFiredBeforeActivity_marksAsBackground() {
     FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
-    Timer fakeTimer = spy(new Timer(currentTime));
     AppStartTrace trace =
         new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
     trace.registerActivityLifecycleCallbacks(appContext);
-    trace.setMainThreadRunnableTime(fakeTimer);
+    // Simulate StartFromBackgroundRunnable having fired before any activity was created.
+    trace.setMainThreadRunnableTime(spy(new Timer(currentTime)));
 
-    // See AppStartTrace.MAX_BACKGROUND_RUNNABLE_DELAY.
-    when(fakeTimer.getDurationMicros()).thenReturn(TimeUnit.MILLISECONDS.toMicros(1000) - 1);
-    trace.onActivityCreated(activity1, bundle);
-    Assert.assertNotNull(trace.getOnCreateTime());
-    ++currentTime;
-    trace.onActivityStarted(activity1);
-    Assert.assertNotNull(trace.getOnStartTime());
-    ++currentTime;
-    trace.onActivityResumed(activity1);
-    Assert.assertNotNull(trace.getOnResumeTime());
-    fakeExecutorService.runAll();
-    // There should be a trace sent since the delay between the main thread and onActivityCreated
-    // is limited.
-    verify(transportManager, times(1))
-        .log(
-            traceArgumentCaptor.capture(),
-            ArgumentMatchers.nullable(ApplicationProcessState.class));
-  }
-
-  @Test
-  public void testStartFromBackground_moreThan1000ms() {
-    FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
-    Timer fakeTimer = spy(new Timer(currentTime));
-    AppStartTrace trace =
-        new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
-    trace.registerActivityLifecycleCallbacks(appContext);
-    trace.setMainThreadRunnableTime(fakeTimer);
-
-    // See AppStartTrace.MAX_BACKGROUND_RUNNABLE_DELAY.
-    when(fakeTimer.getDurationMicros()).thenReturn(TimeUnit.MILLISECONDS.toMicros(1000) + 1);
-    trace.onActivityCreated(activity1, bundle);
-    Assert.assertNull(trace.getOnCreateTime());
-    ++currentTime;
-    trace.onActivityStarted(activity1);
-    Assert.assertNull(trace.getOnStartTime());
-    ++currentTime;
-    trace.onActivityResumed(activity1);
-    Assert.assertNull(trace.getOnResumeTime());
-    // There should be no trace sent.
-    fakeExecutorService.runAll();
-    verify(transportManager, times(0))
-        .log(
-            traceArgumentCaptor.capture(),
-            ArgumentMatchers.nullable(ApplicationProcessState.class));
-  }
-
-  // Regression test for https://github.com/firebase/firebase-android-sdk/issues/8103.
-  // On API 34+ physical devices, the gap between StartFromBackgroundRunnable firing and the
-  // first onActivityCreated has been measured at ~204-316ms on real apps; the previous 50ms
-  // threshold misclassified these as background starts and suppressed _app_start traces.
-  @Test
-  public void testStartFromBackground_largeAppGap_isForegroundStart() {
-    FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
-    Timer fakeTimer = spy(new Timer(currentTime));
-    AppStartTrace trace =
-        new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
-    trace.registerActivityLifecycleCallbacks(appContext);
-    trace.setMainThreadRunnableTime(fakeTimer);
-
-    // Simulates the API 34+ scheduling gap observed in real-world apps.
-    when(fakeTimer.getDurationMicros()).thenReturn(TimeUnit.MILLISECONDS.toMicros(300));
-    trace.onActivityCreated(activity1, bundle);
-    Assert.assertNotNull(trace.getOnCreateTime());
-    ++currentTime;
-    trace.onActivityStarted(activity1);
-    Assert.assertNotNull(trace.getOnStartTime());
-    ++currentTime;
-    trace.onActivityResumed(activity1);
-    Assert.assertNotNull(trace.getOnResumeTime());
-    fakeExecutorService.runAll();
-    verify(transportManager, times(1))
-        .log(
-            traceArgumentCaptor.capture(),
-            ArgumentMatchers.nullable(ApplicationProcessState.class));
-  }
-
-  // Genuine warm starts (process alive for background work, activity launched seconds later)
-  // must still be classified as background and suppressed.
-  @Test
-  public void testStartFromBackground_warmStart_stillSuppressed() {
-    FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
-    Timer fakeTimer = spy(new Timer(currentTime));
-    AppStartTrace trace =
-        new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
-    trace.registerActivityLifecycleCallbacks(appContext);
-    trace.setMainThreadRunnableTime(fakeTimer);
-
-    when(fakeTimer.getDurationMicros()).thenReturn(TimeUnit.SECONDS.toMicros(10));
     trace.onActivityCreated(activity1, bundle);
     Assert.assertNull(trace.getOnCreateTime());
     ++currentTime;
@@ -345,65 +265,93 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
     trace.onActivityResumed(activity1);
     Assert.assertNull(trace.getOnResumeTime());
     fakeExecutorService.runAll();
+
+    // Trace suppressed — pre-bug ordering says background.
     verify(transportManager, times(0))
         .log(
             traceArgumentCaptor.capture(),
             ArgumentMatchers.nullable(ApplicationProcessState.class));
   }
 
-  // --- Phase 2 tests: causal-signal-driven decision, gated by kill switch ---
+  @Test
+  @Config(sdk = 33)
+  public void preApi34_runnableNotFired_traceLogs() {
+    FakeScheduledExecutorService fakeExecutorService = new FakeScheduledExecutorService();
+    AppStartTrace trace =
+        new AppStartTrace(transportManager, clock, configResolver, fakeExecutorService);
+    trace.registerActivityLifecycleCallbacks(appContext);
+    // mainThreadRunnableTime is NOT set — i.e., the runnable hasn't fired yet, which is
+    // the normal pre-bug-ordering state on a cold foreground start.
+
+    currentTime = 1;
+    trace.onActivityCreated(activity1, bundle);
+    currentTime = 2;
+    trace.onActivityStarted(activity1);
+    currentTime = 3;
+    trace.onActivityResumed(activity1);
+    fakeExecutorService.runAll();
+
+    // Trace logs — runnable-before-activity didn't happen.
+    verify(transportManager, times(1))
+        .log(
+            traceArgumentCaptor.capture(),
+            ArgumentMatchers.nullable(ApplicationProcessState.class));
+  }
+
+  // --- Phase 2/3 tests: causal-signal-driven decision, gated by kill switch ---
 
   /**
-   * Helper that builds an AppStartTrace, registers callbacks, and primes a
-   * {@code mainThreadRunnableTime} with the given duration. Used by Phase 2 tests so
-   * each one shows only the bits that vary (flag state, cause, duration).
+   * Builds an {@link AppStartTrace} and registers callbacks, with no
+   * {@code mainThreadRunnableTime} primed (Phase 3 deleted the API 34+ timing-window
+   * machinery, so the field is irrelevant on the API 34+ path).
    */
-  private AppStartTrace newTraceWithRunnable(
-      FakeScheduledExecutorService executor, long mainThreadRunnableDurationMicros) {
-    Timer fakeTimer = spy(new Timer(currentTime));
-    when(fakeTimer.getDurationMicros()).thenReturn(mainThreadRunnableDurationMicros);
+  private AppStartTrace newTrace(FakeScheduledExecutorService executor) {
     AppStartTrace trace = new AppStartTrace(transportManager, clock, configResolver, executor);
     trace.registerActivityLifecycleCallbacks(appContext);
-    trace.setMainThreadRunnableTime(fakeTimer);
     return trace;
   }
 
   @Test
-  public void causalSignal_off_usesExistingTimingWindow() {
-    // Flag off + cause FOREGROUND + timing over the threshold ⇒ existing behavior wins,
-    // trace suppressed. Causal signal is ignored when the kill switch is off.
+  public void causalSignal_off_api34Plus_traceLogsUnconditionally() {
+    // Phase 3: with the timing-window machinery deleted and the kill switch off,
+    // API 34+ does not perform any background-start detection. This is the documented
+    // regression gap that Phase 4 (default flip) will close. Even a clearly-background
+    // ProcessStartCause is ignored here.
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
-        new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
+        new ProcessStartCause(ProcessStartCause.Cause.BACKGROUND, "BROADCAST", "COLD", 400, 35));
     // configResolver.getIsAppStartCausalSignalEnabled() defaults to false on the mock.
 
+    currentTime = 1;
     trace.onActivityCreated(activity1, bundle);
-
-    Assert.assertNull(trace.getOnCreateTime());
+    currentTime = 2;
+    trace.onActivityStarted(activity1);
+    currentTime = 3;
+    trace.onActivityResumed(activity1);
     executor.runAll();
-    verify(transportManager, times(0))
+
+    verify(transportManager, times(1))
         .log(
             traceArgumentCaptor.capture(),
             ArgumentMatchers.nullable(ApplicationProcessState.class));
   }
 
   @Test
-  public void causalSignal_on_foregroundCause_overridesTimingWindow() {
-    // Flag on + cause FOREGROUND + timing over the threshold ⇒ causal signal wins,
-    // trace IS logged despite the timing window pointing to background.
+  public void causalSignal_on_foregroundCause_traceLogs() {
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
     when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
         new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
 
+    currentTime = 1;
     trace.onActivityCreated(activity1, bundle);
     Assert.assertNotNull(trace.getOnCreateTime());
-    ++currentTime;
+    currentTime = 2;
     trace.onActivityStarted(activity1);
     Assert.assertNotNull(trace.getOnStartTime());
-    ++currentTime;
+    currentTime = 3;
     trace.onActivityResumed(activity1);
     Assert.assertNotNull(trace.getOnResumeTime());
     executor.runAll();
@@ -415,19 +363,17 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_backgroundCause_suppressesEvenWithFastTiming() {
-    // Flag on + cause BACKGROUND + timing inside the threshold ⇒ causal signal wins,
-    // trace IS suppressed even though the timing window would have logged it.
+  public void causalSignal_on_backgroundCause_traceSuppressed() {
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
     when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(50));
+    AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
         new ProcessStartCause(ProcessStartCause.Cause.BACKGROUND, "BROADCAST", "COLD", 400, 35));
 
     trace.onActivityCreated(activity1, bundle);
+
     Assert.assertNull(trace.getOnCreateTime());
     executor.runAll();
-
     verify(transportManager, times(0))
         .log(
             traceArgumentCaptor.capture(),
@@ -435,14 +381,15 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_unknownCause_fallsBackToTimingWindow_suppress() {
-    // Flag on + cause UNKNOWN + timing over the threshold ⇒ timing window applies,
-    // trace suppressed.
+  public void causalSignal_on_unknownCause_traceSuppressed() {
+    // Phase 3 change: UNKNOWN no longer falls back to the timing window — it suppresses
+    // directly. This protects against API 34 warm starts (the typical UNKNOWN scenario
+    // there) without the fragile timing heuristic.
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
     when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
-        new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 100, 34));
+        new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 200, 34));
 
     trace.onActivityCreated(activity1, bundle);
 
@@ -455,39 +402,13 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_unknownCause_fallsBackToTimingWindow_log() {
-    // Flag on + cause UNKNOWN + timing inside the threshold ⇒ timing window applies,
-    // trace IS logged.
+  public void causalSignal_on_nullProcessStartCause_traceSuppressed() {
+    // Defensive: if processStartCause is somehow null when the kill switch is on, we
+    // suppress (safest default — better to miss a trace than emit one with no
+    // provenance).
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
     when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(50));
-    trace.setProcessStartCauseForTest(
-        new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 100, 34));
-
-    trace.onActivityCreated(activity1, bundle);
-    Assert.assertNotNull(trace.getOnCreateTime());
-    ++currentTime;
-    trace.onActivityStarted(activity1);
-    Assert.assertNotNull(trace.getOnStartTime());
-    ++currentTime;
-    trace.onActivityResumed(activity1);
-    Assert.assertNotNull(trace.getOnResumeTime());
-    executor.runAll();
-
-    verify(transportManager, times(1))
-        .log(
-            traceArgumentCaptor.capture(),
-            ArgumentMatchers.nullable(ApplicationProcessState.class));
-  }
-
-  @Test
-  public void causalSignal_on_nullProcessStartCause_fallsBackToTimingWindow() {
-    // Defensive: if the field is somehow null at decision time (e.g. registration
-    // failure path), the kill-switch-on branch must not NPE; the existing timing window
-    // takes over.
-    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
-    AppStartTrace trace = newTraceWithRunnable(executor, TimeUnit.MILLISECONDS.toMicros(1500));
+    AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(null);
 
     trace.onActivityCreated(activity1, bundle);

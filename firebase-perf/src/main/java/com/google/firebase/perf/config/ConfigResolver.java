@@ -23,7 +23,6 @@ import androidx.annotation.VisibleForTesting;
 import com.google.firebase.perf.BuildConfig;
 import com.google.firebase.perf.config.ConfigurationConstants.CollectionDeactivated;
 import com.google.firebase.perf.config.ConfigurationConstants.CollectionEnabled;
-import com.google.firebase.perf.config.ConfigurationConstants.ExperimentAppStartCausalSignal;
 import com.google.firebase.perf.config.ConfigurationConstants.ExperimentTTID;
 import com.google.firebase.perf.config.ConfigurationConstants.FragmentSamplingRate;
 import com.google.firebase.perf.config.ConfigurationConstants.LogSourceName;
@@ -837,44 +836,6 @@ public class ConfigResolver {
     }
 
     // Returns default value if there is no valid value from above approaches.
-    return config.getDefault();
-  }
-
-  /**
-   * Returns whether Phase 2 of the AppStartTrace causal-signal refactor is enabled.
-   *
-   * <p>When {@code true}, {@code AppStartTrace.resolveIsStartedFromBackground()} consults
-   * the captured {@code ProcessStartCause} first and only falls back to the existing
-   * timing-window heuristic for {@code UNKNOWN} cases. Default {@code false} so the
-   * refactor ships dark.
-   *
-   * <p>Resolution order matches the standard SDK-enabled pattern: manifest metadata
-   * (developer build-time override) → Remote Config (server-side flip) → device cache
-   * (last known RC value, survives offline) → default. See PLAN_PHASE2.md.
-   */
-  public boolean getIsAppStartCausalSignalEnabled() {
-    ExperimentAppStartCausalSignal config = ExperimentAppStartCausalSignal.getInstance();
-
-    // 1. Manifest metadata override (developer build-time setting).
-    Optional<Boolean> metadataValue = getMetadataBoolean(config);
-    if (metadataValue.isAvailable()) {
-      return metadataValue.get();
-    }
-
-    // 2. Firebase Remote Config (server-side kill switch). Cache the value when present.
-    Optional<Boolean> rcValue = getRemoteConfigBoolean(config);
-    if (rcValue.isAvailable()) {
-      deviceCacheManager.setValue(config.getDeviceCacheFlag(), rcValue.get());
-      return rcValue.get();
-    }
-
-    // 3. Device cache (last known good value, survives offline).
-    Optional<Boolean> deviceCacheValue = getDeviceCacheBoolean(config);
-    if (deviceCacheValue.isAvailable()) {
-      return deviceCacheValue.get();
-    }
-
-    // 4. Default (off).
     return config.getDefault();
   }
 

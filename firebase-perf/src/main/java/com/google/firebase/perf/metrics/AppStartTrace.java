@@ -334,20 +334,17 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
   }
 
   /**
-   * Phase 1 of the causal-signal refactor: attach the captured {@link ProcessStartCause}
-   * as custom attributes on the {@code _experiment_app_start_ttid} trace, alongside the
-   * existing timing-window decision, so production telemetry can compare them. Does not
-   * affect classification. See {@code PLAN_PHASE1_SHADOW_CAPTURE.md}.
+   * Attach the captured {@link ProcessStartCause} as custom attributes on the
+   * {@code _experiment_app_start_ttid} trace so production telemetry surfaces the
+   * OS-reported reason for each cold start. (The rollout-time {@code timingWindowDecision}
+   * and {@code decisionAgreed} attributes were dropped once the timing-window heuristic
+   * was deleted — they no longer carry independent signal now that the cause IS the
+   * decision.)
    */
   private void addProcessStartCauseExperimentAttributes(TraceMetric.Builder trace) {
     ProcessStartCause cause = this.processStartCause;
     if (cause == null) {
-      // Cause is captured during registerActivityLifecycleCallbacks. If we somehow got
-      // here without that running, fall through and just record what we can.
       trace.putCustomAttributes("processStartCause", "unknown");
-      trace.putCustomAttributes(
-          "timingWindowDecision", isStartedFromBackground ? "background" : "foreground");
-      trace.putCustomAttributes("decisionAgreed", "false");
       return;
     }
 
@@ -363,11 +360,6 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
         causeName = "unknown";
         break;
     }
-    String timingDecision = isStartedFromBackground ? "background" : "foreground";
-    String agreed =
-        (cause.cause == ProcessStartCause.Cause.UNKNOWN)
-            ? "unknown"
-            : (causeName.equals(timingDecision) ? "true" : "false");
 
     trace.putCustomAttributes("processStartCause", causeName);
     trace.putCustomAttributes("processStartReasonApi35Plus", cause.reasonName);
@@ -375,8 +367,6 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
     trace.putCustomAttributes(
         "processImportanceApi34",
         (cause.apiLevel == 34 && cause.importance >= 0) ? String.valueOf(cause.importance) : "");
-    trace.putCustomAttributes("timingWindowDecision", timingDecision);
-    trace.putCustomAttributes("decisionAgreed", agreed);
   }
 
   /**
@@ -391,18 +381,10 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
    *       {@link StartFromBackgroundRunnable} fired before the first
    *       {@code onActivityCreated} ({@code mainThreadRunnableTime != null}), the
    *       process was forked for a non-activity reason and we suppress.
-   *   <li><b>API 34+ with kill switch off</b> (default in Phase 3): no detection here;
-   *       the trace logs unconditionally on {@code onActivityCreated}. Phase 4 will
-   *       flip the kill switch default to {@code true} and close this gap.
-   *   <li><b>API 34+ with kill switch on</b>: {@link ProcessStartCause} owns the
-   *       decision. {@code FOREGROUND} lets the trace log; {@code BACKGROUND} and
-   *       {@code UNKNOWN} both suppress (no timing-window fallback — that machinery
-   *       was deleted in Phase 3).
+   *   <li><b>API 34+</b>: {@link ProcessStartCause} owns the decision. {@code FOREGROUND}
+   *       lets the trace log; {@code BACKGROUND} and {@code UNKNOWN} both suppress. A
+   *       null cause (captured-too-late edge case) is treated as background defensively.
    * </ul>
-   *
-   * <p>TODO(b/339891952): Phase 4 — flip
-   * {@link ConfigurationConstants.ExperimentAppStartCausalSignal} default to
-   * {@code true} to close the API 34+ "no detection" gap left by Phase 3.
    *
    * <p>See {@code PLAN_APPSTART_CAUSAL_SIGNAL.md} for the multi-phase plan and
    * {@code RESULTS.md} in the {@code api34-appstart-cause} experiment project for the
@@ -419,13 +401,7 @@ public class AppStartTrace implements ActivityLifecycleCallbacks, LifecycleObser
       return;
     }
 
-    // API 34+ kill switch off (default in Phase 3): the legacy timing-window machinery
-    // is gone. No background-start detection on this path. Trace logs unconditionally.
-    if (!configResolver.getIsAppStartCausalSignalEnabled()) {
-      return;
-    }
-
-    // API 34+ kill switch on: ProcessStartCause is the only signal.
+    // API 34+: ProcessStartCause is the only signal.
     if (processStartCause == null) {
       // Defensive: cause wasn't captured (registration didn't run). Suppress to be
       // safe; we'd rather miss a trace than emit one with no provenance.

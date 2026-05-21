@@ -298,13 +298,12 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
             ArgumentMatchers.nullable(ApplicationProcessState.class));
   }
 
-  // --- Phase 2/3 tests: causal-signal-driven decision, gated by kill switch ---
+  // --- API 34+ causal-signal decision tests ---
+  //
+  // After Phase 3 + Phase 4, the kill switch is gone and the causal signal is the only
+  // decision input on API 34+. These tests exercise each ProcessStartCause.Cause value.
 
-  /**
-   * Builds an {@link AppStartTrace} and registers callbacks, with no
-   * {@code mainThreadRunnableTime} primed (Phase 3 deleted the API 34+ timing-window
-   * machinery, so the field is irrelevant on the API 34+ path).
-   */
+  /** Builds an {@link AppStartTrace} and registers callbacks. */
   private AppStartTrace newTrace(FakeScheduledExecutorService executor) {
     AppStartTrace trace = new AppStartTrace(transportManager, clock, configResolver, executor);
     trace.registerActivityLifecycleCallbacks(appContext);
@@ -312,35 +311,8 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_off_api34Plus_traceLogsUnconditionally() {
-    // Phase 3: with the timing-window machinery deleted and the kill switch off,
-    // API 34+ does not perform any background-start detection. This is the documented
-    // regression gap that Phase 4 (default flip) will close. Even a clearly-background
-    // ProcessStartCause is ignored here.
+  public void api34Plus_foregroundCause_traceLogs() {
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    AppStartTrace trace = newTrace(executor);
-    trace.setProcessStartCauseForTest(
-        new ProcessStartCause(ProcessStartCause.Cause.BACKGROUND, "BROADCAST", "COLD", 400, 35));
-    // configResolver.getIsAppStartCausalSignalEnabled() defaults to false on the mock.
-
-    currentTime = 1;
-    trace.onActivityCreated(activity1, bundle);
-    currentTime = 2;
-    trace.onActivityStarted(activity1);
-    currentTime = 3;
-    trace.onActivityResumed(activity1);
-    executor.runAll();
-
-    verify(transportManager, times(1))
-        .log(
-            traceArgumentCaptor.capture(),
-            ArgumentMatchers.nullable(ApplicationProcessState.class));
-  }
-
-  @Test
-  public void causalSignal_on_foregroundCause_traceLogs() {
-    FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
     AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
         new ProcessStartCause(ProcessStartCause.Cause.FOREGROUND, "LAUNCHER", "COLD", 100, 35));
@@ -363,9 +335,8 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_backgroundCause_traceSuppressed() {
+  public void api34Plus_backgroundCause_traceSuppressed() {
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
     AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
         new ProcessStartCause(ProcessStartCause.Cause.BACKGROUND, "BROADCAST", "COLD", 400, 35));
@@ -381,12 +352,11 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_unknownCause_traceSuppressed() {
-    // Phase 3 change: UNKNOWN no longer falls back to the timing window — it suppresses
-    // directly. This protects against API 34 warm starts (the typical UNKNOWN scenario
-    // there) without the fragile timing heuristic.
+  public void api34Plus_unknownCause_traceSuppressed() {
+    // UNKNOWN typically means an API 34 warm start (importance != FOREGROUND at capture)
+    // or an API 35+ start where the historical-reasons API returned nothing. Suppress
+    // to bias toward correctness for the dominant warm-start case.
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
     AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(
         new ProcessStartCause(ProcessStartCause.Cause.UNKNOWN, "", "", 200, 34));
@@ -402,12 +372,11 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
   }
 
   @Test
-  public void causalSignal_on_nullProcessStartCause_traceSuppressed() {
-    // Defensive: if processStartCause is somehow null when the kill switch is on, we
-    // suppress (safest default — better to miss a trace than emit one with no
-    // provenance).
+  public void api34Plus_nullProcessStartCause_traceSuppressed() {
+    // Defensive: if processStartCause is somehow null at decision time (e.g. the
+    // capture didn't run), suppress — better to miss a trace than emit one with no
+    // provenance.
     FakeScheduledExecutorService executor = new FakeScheduledExecutorService();
-    when(configResolver.getIsAppStartCausalSignalEnabled()).thenReturn(true);
     AppStartTrace trace = newTrace(executor);
     trace.setProcessStartCauseForTest(null);
 
@@ -518,7 +487,5 @@ public class AppStartTraceTest extends FirebasePerformanceTestBase {
     assertThat(ttid.getCustomAttributesMap()).containsEntry("processStartTypeApi35Plus", "COLD");
     // The injected cause has apiLevel=35, so the API-34-only importance attribute stays empty.
     assertThat(ttid.getCustomAttributesMap()).containsEntry("processImportanceApi34", "");
-    assertThat(ttid.getCustomAttributesMap()).containsEntry("timingWindowDecision", "foreground");
-    assertThat(ttid.getCustomAttributesMap()).containsEntry("decisionAgreed", "true");
   }
 }
